@@ -5,6 +5,8 @@ import json
 import logging
 import math
 import os
+import random
+import time
 
 from datetime import datetime, timezone
 
@@ -34,15 +36,9 @@ OPENROUTER_KEY = os.getenv(
 
 DB_PATH = os.getenv("DB_PATH", "trader.db")
 
-INTERVAL = 900
-
 START_BALANCE = 20.0
 
-# Приблизительная комиссия одной стороны
 FEE = 0.001
-
-# Условная половина спреда
-HALF_SPREAD = 0.0005
 
 SYMBOLS = [
     "BTCUSDT",
@@ -59,15 +55,9 @@ SYMBOLS = [
 
 MEXC_URL = "https://api.mexc.com"
 
-OPENROUTER_URL = (
-    "https://openrouter.ai/api/v1"
-)
+OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
-# Можно указать конкретную бесплатную модель
-# в переменных окружения Bothost
-MODEL = os.getenv(
-    "OPENROUTER_MODEL", ""
-).strip()
+MODEL = os.getenv("OPENROUTER_MODEL", "").strip()
 
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN отсутствует")
@@ -101,8 +91,10 @@ dp = Dispatcher()
 session = None
 
 trading_lock = asyncio.Lock()
+db_lock = asyncio.Lock()
 
-selected_model = None
+free_models = []
+model_index = 0
 
 
 # ==========================================
@@ -124,7 +116,9 @@ DEFAULTS = {
     "position_qty": "0",
     "position_entry": "0",
     "position_cost": "0",
-    "last_cycle": "Никогда"
+    "last_cycle": "Никогда",
+    "interval_minutes": "10",
+    "last_model": "Не выбрана"
 }
 
 
@@ -191,18 +185,20 @@ async def get_setting(key):
 
 async def set_setting(key, value):
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_lock:
 
-        await db.execute(
-            """
-            INSERT INTO settings VALUES (?, ?)
-            ON CONFLICT(key)
-            DO UPDATE SET value=excluded.value
-            """,
-            (key, str(value))
-        )
+        async with aiosqlite.connect(DB_PATH) as db:
 
-        await db.commit()
+            await db.execute(
+                """
+                INSERT INTO settings VALUES (?, ?)
+                ON CONFLICT(key)
+                DO UPDATE SET value=excluded.value
+                """,
+                (key, str(value))
+            )
+
+            await db.commit()
 
 
 async def get_float(key):
@@ -335,7 +331,8 @@ def main_kb():
             ("⚙️ Настройки", "settings")
         ],
         [
-            ("🔍 Анализ сейчас", "analyze")
+            ("🔍 Анализ сейчас", "analyze"),
+            ("🔌 Проверить ИИ", "test_ai")
         ],
         [
             ("🚨 ЭКСТРЕННАЯ ОСТАНОВКА", "emergency")
@@ -354,6 +351,7 @@ def settings_kb():
 
     return keyboard([
         [("🤖 Стратегия", "strategy")],
+        [("⏰ Интервал анализа", "interval")],
         [("📉 Дневной убыток", "loss")],
         [("💵 Размер сделки", "trade_size")],
         [("💰 Сброс демобаланса", "reset_balance")],
@@ -367,7 +365,7 @@ def settings_kb():
 
 async def http_json(url, params=None, headers=None, body=None):
 
-    timeout = aiohttp.ClientTimeout(total=25)
+    timeout = aiohttp.ClientTimeout(total=45)
 
     if body is None:
 
@@ -378,9 +376,14 @@ async def http_json(url, params=None, headers=None, body=None):
             timeout=timeout
         ) as response:
 
-            response.raise_for_status()
+            text = await response.text()
 
-            return await response.json()
+            if response.status >= 400:
+                raise RuntimeError(
+                    f"HTTP {response.status}: {text[:300]}"
+                )
+
+            return json.loads(text)
 
     async with session.post(
         url,
@@ -389,9 +392,15 @@ async def http_json(url, params=None, headers=None, body=None):
         timeout=timeout
     ) as response:
 
-        response.raise_for_status()
+        text = await response.text()
 
-        return await response.json()
+        if response.status >= 400:
+
+            raise RuntimeError(
+                f"HTTP {response.status}: {text[:300]}"
+            )
+
+        return json.loads(text)
 
 
 # ==========================================
@@ -412,7 +421,6 @@ async def get_candles(symbol):
     if not isinstance(data, list) or len(data) < 55:
         raise RuntimeError("Недостаточно свечей")
 
-    # Последняя свеча может быть незакрытой
     return data[:-1]
 
 
@@ -584,72 +592,68 @@ async def scan_market():
 
 
 # ==========================================
-# OPENROUTER
+# OPENROUTER MODEL MANAGEMENT
 # ==========================================
 
-async def find_free_model():
+async def load_free_models():
 
-    global selected_model
+    global free_models
 
     if MODEL:
-        return MODEL
 
-    if selected_model:
-        return selected_model
+        free_models = [MODEL]
 
-    models = await http_json(
+        return free_models
+
+    data = await http_json(
         OPENROUTER_URL + "/models"
     )
 
-    free = []
+    models = []
 
-    for item in models.get("data", []):
+    for item in data.get("data", []):
 
         pricing = item.get("pricing", {})
 
         try:
-            prompt_cost = float(
+
+            prompt = float(
                 pricing.get("prompt", "1")
             )
 
-            completion_cost = float(
+            completion = float(
                 pricing.get("completion", "1")
             )
 
         except (ValueError, TypeError):
             continue
 
-        if prompt_cost != 0 or completion_cost != 0:
+        if prompt != 0 or completion != 0:
             continue
 
-        context = item.get("context_length") or 0
-
-        if context < 4096:
+        if (item.get("context_length") or 0) < 4096:
             continue
 
-        free.append(item["id"])
+        model_id = item.get("id", "")
 
-    # Предпочитаем модели с явным суффиксом free
-    free.sort(
-        key=lambda x: (
-            not x.endswith(":free"),
-            x
-        )
-    )
+        if model_id.endswith(":free"):
+            models.append(model_id)
 
-    if not free:
+    random.shuffle(models)
+
+    if not models:
         raise RuntimeError(
             "Бесплатные модели OpenRouter не найдены"
         )
 
-    selected_model = free[0]
+    free_models = models
 
     logger.info(
-        "OpenRouter model: %s",
-        selected_model
+        "Free OpenRouter models found: %s",
+        len(models)
     )
 
-    return selected_model
+    return models
 
 
 async def ask_ai(system_prompt, user_data):
@@ -659,57 +663,142 @@ async def ask_ai(system_prompt, user_data):
             "OPENROUTER_API_KEY отсутствует"
         )
 
-    model = await find_free_model()
+    if not free_models:
+        await load_free_models()
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_KEY}",
-        "Content-Type": "application/json"
-    }
+    errors = []
 
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    user_data,
-                    ensure_ascii=False
-                )
+    # Пробуем до 4 моделей
+    candidates = free_models[:4]
+
+    for model in candidates:
+
+        try:
+
+            start_time = time.monotonic()
+
+            headers = {
+                "Authorization": (
+                    f"Bearer {OPENROUTER_KEY}"
+                ),
+                "Content-Type": "application/json"
             }
-        ],
-        "temperature": 0.2,
-        "max_tokens": 400
-    }
 
-    result = await http_json(
-        OPENROUTER_URL + "/chat/completions",
-        headers=headers,
-        body=payload
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": system_prompt
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            user_data,
+                            ensure_ascii=False
+                        )
+                    }
+                ],
+                "temperature": 0.2,
+                "max_tokens": 1500
+            }
+
+            result = await http_json(
+                OPENROUTER_URL + "/chat/completions",
+                headers=headers,
+                body=payload
+            )
+
+            choices = result.get("choices", [])
+
+            if not choices:
+                raise RuntimeError("Нет choices")
+
+            choice = choices[0]
+
+            message = choice.get("message") or {}
+
+            content = message.get("content")
+
+            finish_reason = choice.get(
+                "finish_reason"
+            )
+
+            logger.info(
+                "OpenRouter model=%s finish=%s content_type=%s",
+                model,
+                finish_reason,
+                type(content).__name__
+            )
+
+            if not isinstance(content, str) or not content.strip():
+
+                raise RuntimeError(
+                    f"Пустой ответ; finish={finish_reason}"
+                )
+
+            content = content.strip()
+
+            if "```" in content:
+
+                content = content.replace(
+                    "```json", ""
+                ).replace(
+                    "```", ""
+                )
+
+            start = content.find("{")
+            end = content.rfind("}")
+
+            if start == -1 or end == -1:
+                raise RuntimeError(
+                    "Модель не вернула JSON"
+                )
+
+            parsed = json.loads(
+                content[start:end + 1]
+            )
+
+            if not isinstance(parsed, dict):
+                raise RuntimeError(
+                    "Ответ ИИ не является объектом"
+                )
+
+            elapsed = time.monotonic() - start_time
+
+            await set_setting(
+                "last_model",
+                model
+            )
+
+            logger.info(
+                "AI success model=%s time=%.2fs",
+                model,
+                elapsed
+            )
+
+            return parsed
+
+        except Exception as error:
+
+            error_text = str(error)
+
+            # Не записываем полный HTTP-ответ:
+            # он может содержать лишние данные.
+            logger.warning(
+                "AI model failed: %s | %s",
+                model,
+                error_text[:200]
+            )
+
+            errors.append(
+                f"{model}: {error_text[:100]}"
+            )
+
+    raise RuntimeError(
+        "Все бесплатные модели не ответили: "
+        + " | ".join(errors)[:500]
     )
-
-    content = result["choices"][0]["message"]["content"]
-
-    if not isinstance(content, str):
-        raise RuntimeError("ИИ вернул пустой ответ")
-
-    # Некоторые модели добавляют Markdown
-    content = content.strip()
-
-    if "```" in content:
-        content = content.replace("```json", "")
-        content = content.replace("```", "")
-
-    start = content.find("{")
-    end = content.rfind("}")
-
-    if start == -1 or end == -1:
-        raise RuntimeError("ИИ не вернул JSON")
-
-    return json.loads(content[start:end + 1])
 
 
 # ==========================================
@@ -717,16 +806,12 @@ async def ask_ai(system_prompt, user_data):
 # ==========================================
 
 ANALYST_PROMPT = """
-Ты аналитик экспериментального криптотрейдера.
+Ты аналитик экспериментального
+криптовалютного демотрейдера.
 
-Работаешь только в деморежиме.
+Анализируй только предоставленные данные.
 
-Тебе передают технические индикаторы,
-текущую стратегию и информацию о позиции.
-
-Не выдумывай цены, новости или индикаторы.
-
-Твоя задача — предложить действие.
+Не выдумывай цены и новости.
 
 Если позиции нет:
 BUY или HOLD.
@@ -734,49 +819,38 @@ BUY или HOLD.
 Если позиция открыта:
 SELL или HOLD.
 
-Если предлагаешь BUY, выбирай только
-символ из переданного списка.
-
-Верни строго JSON:
+Возвращай строго JSON:
 
 {
- "action": "BUY",
+ "action": "HOLD",
  "symbol": "BTCUSDT",
  "percent": 30,
  "reason": "Краткая причина"
 }
 
-percent — процент свободного баланса,
-от 1 до 100.
-
-При недостаточных данных выбирай HOLD.
+При сомнениях выбирай HOLD.
 """
 
 
 CRITIC_PROMPT = """
-Ты независимый риск-аналитик
-экспериментального криптотрейдера.
+Ты независимый риск-аналитик.
 
-Проверь предложение первого агента.
+Проверь предложение первого ИИ.
 
 Не соглашайся автоматически.
 
-Учитывай комиссии, тренд,
-волатильность и ограничения риска.
+Учитывай рыночный тренд,
+комиссии и риск.
 
-Не выдумывай данные.
-
-Верни строго JSON:
+Ответ строго JSON:
 
 {
  "approved": false,
- "reason": "Краткое объяснение"
+ "reason": "Краткая причина"
 }
 
-Для HOLD возвращай approved=false.
-
 Если данных недостаточно,
-отклоняй сделку.
+отклони предложение.
 """
 
 
@@ -846,27 +920,17 @@ async def get_equity():
     if not position:
         return balance
 
-    try:
+    bid, ask = await get_price(
+        position["symbol"]
+    )
 
-        bid, ask = await get_price(
-            position["symbol"]
-        )
+    liquidation_value = (
+        position["qty"]
+        * bid
+        * (1 - FEE)
+    )
 
-        liquidation_value = (
-            position["qty"]
-            * bid
-            * (1 - FEE)
-        )
-
-        return balance + liquidation_value
-
-    except Exception:
-
-        # При отсутствии котировок не принимаем
-        # новых решений о риске
-        raise RuntimeError(
-            "Невозможно оценить открытую позицию"
-        )
+    return balance + liquidation_value
 
 
 async def update_daily_risk():
@@ -974,18 +1038,25 @@ async def demo_buy(symbol, percent):
 
     amount = balance * percent / 100
 
-    # Минимальная сумма виртуального ордера.
-    # Это НЕ подтверждённый лимит MEXC.
     if amount < 5:
         return "Сумма покупки меньше $5"
 
     bid, ask = await get_price(symbol)
 
-    # Используем реальную котировку ask
-    qty = (amount * (1 - FEE)) / ask
+    qty = (
+        amount * (1 - FEE)
+    ) / ask
 
     if not math.isfinite(qty) or qty <= 0:
         return "Некорректный объём"
+
+    # Повторная проверка непосредственно
+    # перед сохранением сделки.
+    if await get_setting("autopilot") != "ON":
+        return "Автопилот остановлен"
+
+    if await get_setting("emergency_stop") == "ON":
+        return "Аварийная блокировка"
 
     await set_setting(
         "balance",
@@ -1027,13 +1098,19 @@ async def demo_buy(symbol, percent):
         f"💰 Потрачено: ${amount:.2f}\n"
         f"📊 Цена: ${ask:.8f}\n"
         f"🔢 Количество: {qty:.8f}\n"
-        f"💸 Комиссия учтена: {FEE*100:.2f}%"
+        f"💸 Комиссия: {FEE*100:.2f}%"
     )
 
     return f"BUY {symbol} ${amount:.2f}"
 
 
 async def demo_sell():
+
+    if await get_setting("autopilot") != "ON":
+        return "Автопилот выключен"
+
+    if await get_setting("emergency_stop") == "ON":
+        return "Аварийная блокировка"
 
     position = await get_position()
 
@@ -1053,6 +1130,13 @@ async def demo_sell():
     pnl = value - position["cost"]
 
     balance = await get_float("balance")
+
+    # Проверяем состояние ещё раз
+    if await get_setting("autopilot") != "ON":
+        return "Автопилот остановлен"
+
+    if await get_setting("emergency_stop") == "ON":
+        return "Аварийная блокировка"
 
     await set_setting(
         "balance",
@@ -1103,7 +1187,7 @@ async def demo_sell():
 # TRADING ENGINE
 # ==========================================
 
-async def trading_cycle(force=False):
+async def trading_cycle():
 
     if trading_lock.locked():
         return "Анализ уже выполняется"
@@ -1124,7 +1208,7 @@ async def trading_cycle(force=False):
             market = await scan_market()
 
             if not market:
-                return "MEXC не вернула рыночные данные"
+                return "MEXC не вернула данные"
 
             position = await get_position()
 
@@ -1143,16 +1227,12 @@ async def trading_cycle(force=False):
 
                 await bot.send_message(
                     ADMIN_ID,
-                    "🚨 Достигнут дневной лимит убытка.\n"
-                    "Автопилот остановлен.\n"
-                    "Открытая позиция не закрывается "
-                    "автоматически."
+                    "🚨 Дневной лимит убытка достигнут.\n"
+                    "Автопилот остановлен."
                 )
 
                 return "Лимит убытка"
 
-            # Если позиция открыта, передаём
-            # агентам данные именно по ней.
             if position:
 
                 current = next(
@@ -1164,7 +1244,7 @@ async def trading_cycle(force=False):
                 )
 
                 if not current:
-                    return "Нет данных открытой позиции"
+                    return "Нет данных позиции"
 
                 selected = [current]
 
@@ -1208,6 +1288,7 @@ async def trading_cycle(force=False):
                     if symbol in allowed_symbols:
 
                         try:
+
                             percent = float(
                                 analyst.get("percent", 0)
                             )
@@ -1262,15 +1343,8 @@ async def trading_cycle(force=False):
                 f"⚖️ Итог: {result}"
             )
 
-            logger.info(
-                "Trading result: %s",
-                result
-            )
-
-            # HOLD тоже сохраняется,
-            # но не засоряем Telegram
-            # уведомлениями каждые 15 минут.
             if action != "HOLD":
+
                 await bot.send_message(
                     ADMIN_ID,
                     text[:4000]
@@ -1286,13 +1360,13 @@ async def trading_cycle(force=False):
 
             return (
                 "Ошибка анализа: "
-                + str(error)[:300]
+                + str(error)[:500]
             )
 
 
 async def trading_loop():
 
-    await asyncio.sleep(15)
+    await asyncio.sleep(10)
 
     while True:
 
@@ -1303,15 +1377,19 @@ async def trading_loop():
                 result = await trading_cycle()
 
                 logger.info(
-                    "Cycle: %s",
-                    result[:200]
+                    "Cycle result: %s",
+                    result[:150]
                 )
 
         except Exception:
 
             logger.exception("Trading loop error")
 
-        await asyncio.sleep(INTERVAL)
+        interval = int(
+            await get_setting("interval_minutes")
+        )
+
+        await asyncio.sleep(interval * 60)
 
 
 # ==========================================
@@ -1330,6 +1408,10 @@ async def main_text():
 
     limit = await get_setting("daily_loss_limit")
 
+    interval = await get_setting(
+        "interval_minutes"
+    )
+
     status = (
         "🟢 ВКЛ"
         if autopilot == "ON"
@@ -1340,7 +1422,7 @@ async def main_text():
         status = "🚨 ЗАБЛОКИРОВАН"
 
     return (
-        "🤖 AI CRYPTO TRADER v1.1\n\n"
+        "🤖 AI CRYPTO TRADER v1.2\n\n"
         f"💰 Свободный баланс: ${balance:.2f}\n"
         f"📊 Стратегия: {strategy}\n"
         f"📉 Дневной лимит: {limit}%\n"
@@ -1348,7 +1430,7 @@ async def main_text():
         "🧠 Агенты: OpenRouter\n"
         "🏦 Рынок: MEXC\n"
         "💵 Режим: DEMO\n"
-        "⏰ Анализ: каждые 15 минут\n\n"
+        f"⏰ Анализ: каждые {interval} минут\n\n"
         "⚙️ Выбери действие:"
     )
 
@@ -1425,10 +1507,8 @@ async def start_auto(callback: CallbackQuery):
     await callback.message.edit_text(
         "🚀 АВТОПИЛОТ ЗАПУЩЕН\n\n"
         "🤖 Два ИИ-агента активированы.\n"
-        "📊 Интервал: 15 минут.\n"
         "💵 Режим: DEMO.\n\n"
-        "Первый анализ начнётся "
-        "в ближайшем торговом цикле.",
+        "Бот самостоятельно анализирует рынок.",
         reply_markup=back_kb()
     )
 
@@ -1442,10 +1522,8 @@ async def stop_auto(callback: CallbackQuery):
 
     await callback.message.edit_text(
         "🛑 Автопилот выключен.\n\n"
-        "Новые торговые циклы остановлены.\n"
-        "Открытая позиция сохраняется.\n\n"
-        "⚠️ Уже выполняющийся анализ "
-        "может завершиться.",
+        "Новые сделки запрещены.\n"
+        "Открытая позиция сохраняется.",
         reply_markup=back_kb()
     )
 
@@ -1465,10 +1543,8 @@ async def emergency(callback: CallbackQuery):
 
     await callback.message.edit_text(
         "🚨 АВАРИЙНАЯ ОСТАНОВКА\n\n"
-        "Новые торговые циклы заблокированы.\n"
-        "Открытая позиция сохраняется.\n\n"
-        "⚠️ В этой версии блокировка "
-        "не ликвидирует позицию.",
+        "Автопилот отключён.\n"
+        "Новые сделки заблокированы.",
         reply_markup=keyboard([
             [("🔓 Снять блокировку", "unlock")],
             [("🔙 Главное меню", "menu")]
@@ -1525,7 +1601,7 @@ async def balance_handler(callback: CallbackQuery):
     except Exception as error:
 
         await callback.message.answer(
-            f"Ошибка оценки портфеля: {error}"
+            f"Ошибка: {error}"
         )
 
     await callback.answer()
@@ -1565,16 +1641,13 @@ async def position_handler(callback: CallbackQuery):
                 f"🪙 {position['symbol']}\n"
                 f"📊 Вход: ${position['entry']:.8f}\n"
                 f"💰 Вложено: ${position['cost']:.4f}\n"
-                f"💵 Текущая стоимость: ${value:.4f}\n"
+                f"💵 Стоимость: ${value:.4f}\n"
                 f"📈 PNL: ${pnl:+.4f}"
             )
 
         except Exception as error:
 
-            text = (
-                "Не удалось получить цену: "
-                + str(error)
-            )
+            text = str(error)
 
     await callback.message.edit_text(
         text,
@@ -1617,7 +1690,7 @@ async def stats_handler(callback: CallbackQuery):
 
 
 # ==========================================
-# AI DECISIONS
+# DECISIONS
 # ==========================================
 
 @dp.callback_query(F.data == "decisions")
@@ -1697,10 +1770,55 @@ async def analyze_handler(callback: CallbackQuery):
         "Запускаю анализ..."
     )
 
-    result = await trading_cycle(force=True)
+    result = await trading_cycle()
 
     await callback.message.answer(
         result[:4000],
+        reply_markup=back_kb()
+    )
+
+
+# ==========================================
+# AI TEST
+# ==========================================
+
+@dp.callback_query(F.data == "test_ai")
+async def test_ai_handler(callback: CallbackQuery):
+
+    await callback.answer(
+        "Проверяю OpenRouter..."
+    )
+
+    try:
+
+        result = await ask_ai(
+            """
+            Ты тестовый ИИ.
+            Верни строго JSON:
+            {"status":"ok","message":"AI работает"}
+            """,
+            {
+                "test": True
+            }
+        )
+
+        model = await get_setting("last_model")
+
+        text = (
+            "✅ OPENROUTER РАБОТАЕТ\n\n"
+            f"🤖 Модель: {model}\n"
+            f"📦 Ответ: {json.dumps(result, ensure_ascii=False)}"
+        )
+
+    except Exception as error:
+
+        text = (
+            "❌ ОШИБКА OPENROUTER\n\n"
+            + str(error)[:1500]
+        )
+
+    await callback.message.answer(
+        text[:4000],
         reply_markup=back_kb()
     )
 
@@ -1720,13 +1838,65 @@ async def settings_handler(callback: CallbackQuery):
         "max_trade_percent"
     )
 
+    interval = await get_setting(
+        "interval_minutes"
+    )
+
     await callback.message.edit_text(
         "⚙️ НАСТРОЙКИ\n\n"
         f"🤖 Стратегия: {strategy}\n"
+        f"⏰ Интервал: {interval} мин\n"
         f"📉 Дневной лимит: {loss}%\n"
         f"💵 Размер сделки: {trade}%\n\n"
         "Выбери параметр:",
         reply_markup=settings_kb()
+    )
+
+    await callback.answer()
+
+
+# ==========================================
+# INTERVAL
+# ==========================================
+
+@dp.callback_query(F.data == "interval")
+async def interval_handler(callback: CallbackQuery):
+
+    await callback.message.edit_text(
+        "⏰ ИНТЕРВАЛ АНАЛИЗА\n\n"
+        "Выбери, как часто ИИ будет "
+        "проверять рынок:",
+        reply_markup=keyboard([
+            [("⚡ 5 минут", "i_5")],
+            [("🟢 10 минут", "i_10")],
+            [("🛡️ 15 минут", "i_15")],
+            [("🔙 Назад", "settings")]
+        ])
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("i_"))
+async def interval_select(callback: CallbackQuery):
+
+    value = callback.data[2:]
+
+    if value not in ("5", "10", "15"):
+
+        await callback.answer("Ошибка")
+        return
+
+    await set_setting(
+        "interval_minutes",
+        value
+    )
+
+    await callback.message.edit_text(
+        f"✅ Интервал анализа: {value} минут.\n\n"
+        "Новый интервал применяется "
+        "после завершения текущего ожидания.",
+        reply_markup=back_kb()
     )
 
     await callback.answer()
@@ -1926,7 +2096,7 @@ async def reset_handler(
         "💰 Введи новый демобаланс.\n"
         "От $10 до $100000.\n\n"
         "⚠️ Открытая позиция будет удалена.\n"
-        "История предыдущих сделок сохранится.\n\n"
+        "История сохранится.\n\n"
         "Отмена: /cancel"
     )
 
@@ -2026,8 +2196,6 @@ async def main():
 
     await init_db()
 
-    # Безопасный старт после обновления:
-    # автопилот нужно включить вручную.
     await set_setting("autopilot", "OFF")
 
     session = aiohttp.ClientSession()
@@ -2037,7 +2205,7 @@ async def main():
     )
 
     logger.info(
-        "AI CRYPTO TRADER v1.1 STARTED"
+        "AI CRYPTO TRADER v1.2 STARTED"
     )
 
     task = asyncio.create_task(
