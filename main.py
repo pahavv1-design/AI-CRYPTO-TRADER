@@ -5,13 +5,14 @@ import time
 import asyncio
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 import aiohttp
 import aiosqlite
 
 from web3 import AsyncWeb3, AsyncHTTPProvider
 
-from aiogram import Bot, Dispatcher, F, BaseMiddleware
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
     Message,
@@ -21,15 +22,24 @@ from aiogram.types import (
 )
 
 
-# ==========================================
+# =========================================
 # CONFIG
-# ==========================================
+# =========================================
 
-TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+TOKEN = os.getenv(
+    "TELEGRAM_TOKEN", ""
+).strip()
 
-AI_KEY = os.getenv(
+ADMIN_ID = int(
+    os.getenv("ADMIN_ID", "0")
+)
+
+OPENROUTER_KEY = os.getenv(
     "OPENROUTER_API_KEY", ""
+).strip()
+
+ZEROX_KEY = os.getenv(
+    "ZEROX_API_KEY", ""
 ).strip()
 
 WALLET = os.getenv(
@@ -39,150 +49,179 @@ WALLET = os.getenv(
 RPC = os.getenv(
     "BASE_RPC_URL",
     "https://mainnet.base.org"
-).strip()
-
-DB_PATH = os.getenv(
-    "DB_PATH",
-    "trader_v13.db"
 )
 
-AI_MODEL = os.getenv(
+MODEL = os.getenv(
     "OPENROUTER_MODEL",
     "openrouter/free"
-).strip()
+)
+
+DB = os.getenv(
+    "DB_PATH",
+    "trader_v20.db"
+)
+
+CHAIN_ID = 8453
+
+START_BALANCE = 20.0
+
+MIN_TRADE = 2.0
+MAX_TRADE = 5.0
+
+DAILY_LOSS = 10.0
+MAX_DRAWDOWN = 25.0
+
+# Дополнительный резерв на расходы
+# виртуального исполнения.
+SIMULATION_COST = Decimal("0.001")
+
+MAX_AI_CALLS = 40
+
+ZEROX_API = (
+    "https://api.0x.org/"
+    "swap/allowance-holder"
+)
+
+# =========================================
+# TOKENS — BASE
+# =========================================
+
+TOKENS = {
+
+    "USDC": {
+        "address": (
+            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+        ),
+        "decimals": 6
+    },
+
+    "WETH": {
+        "address": (
+            "0x4200000000000000000000000000000000000006"
+        ),
+        "decimals": 18
+    },
+
+    "cbBTC": {
+        "address": (
+            "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
+        ),
+        "decimals": 8
+    },
+
+    "AERO": {
+        "address": (
+            "0x940181a94A35A4569E4529A3CDFB74E38FD98631"
+        ),
+        "decimals": 18
+    }
+
+}
+
+TRADE_TOKENS = [
+    "WETH",
+    "cbBTC",
+    "AERO"
+]
 
 if not TOKEN or ADMIN_ID <= 0:
     raise RuntimeError(
         "Проверь TELEGRAM_TOKEN и ADMIN_ID"
     )
 
-# Base Mainnet
-CHAIN_ID = 8453
+if not OPENROUTER_KEY:
+    raise RuntimeError(
+        "OPENROUTER_API_KEY отсутствует"
+    )
 
-# Native USDC on Base
-USDC = AsyncWeb3.to_checksum_address(
-    "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-)
+if not ZEROX_KEY:
+    raise RuntimeError(
+        "ZEROX_API_KEY отсутствует"
+    )
 
-# WETH on Base
-WETH = AsyncWeb3.to_checksum_address(
-    "0x4200000000000000000000000000000000000006"
-)
+if not AsyncWeb3.is_address(WALLET):
+    raise RuntimeError(
+        "Неверный WALLET_ADDRESS"
+    )
 
-# Экспериментальные параметры
-START_BALANCE = 20.0
 
-# Условная комиссия DEX за сторону.
-# Не является подтверждённым тарифом Aerodrome.
-DEMO_FEE = 0.003
-
-# Дополнительное условное проскальзывание.
-DEMO_SLIPPAGE = 0.001
-
-MIN_DEMO_TRADE = 2.0
-
-MAX_DAILY_AI_CALLS = 40
-
-AI_COOLDOWN = 900
-
-# ==========================================
+# =========================================
 # LOGGING
-# ==========================================
+# =========================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    )
 )
 
-logging.getLogger("httpx").setLevel(
-    logging.WARNING
+logging.getLogger(
+    "httpx"
+).setLevel(logging.WARNING)
+
+logging.getLogger(
+    "httpcore"
+).setLevel(logging.WARNING)
+
+logger = logging.getLogger(
+    "AI_CRYPTO_TRADER"
 )
 
-logging.getLogger("httpcore").setLevel(
-    logging.WARNING
-)
 
-logger = logging.getLogger("BASE_TRADER")
-
-
-# ==========================================
-# APPLICATION
-# ==========================================
+# =========================================
+# BOT
+# =========================================
 
 bot = Bot(token=TOKEN)
+
 dp = Dispatcher()
 
 http = None
 web3 = None
 
 trade_lock = asyncio.Lock()
-
-last_ai_error = ""
-last_ai_attempt = 0
+db_lock = asyncio.Lock()
 
 
-# ==========================================
-# SECURITY
-# ==========================================
-
-class AdminMiddleware(BaseMiddleware):
-
-    async def __call__(
-        self,
-        handler,
-        event,
-        data
-    ):
-
-        user = data.get("event_from_user")
-
-        if not user:
-            return None
-
-        if user.id != ADMIN_ID:
-            return None
-
-        return await handler(event, data)
-
-
-dp.message.outer_middleware(
-    AdminMiddleware()
-)
-
-dp.callback_query.outer_middleware(
-    AdminMiddleware()
-)
-
-
-# ==========================================
+# =========================================
 # DATABASE
-# ==========================================
+# =========================================
 
 DEFAULTS = {
+
     "cash": "20",
     "initial": "20",
-    "quantity": "0",
-    "entry_cost": "0",
+
     "autopilot": "OFF",
     "emergency": "OFF",
+
     "strategy": "AUTO",
     "interval": "10",
+
     "daily_limit": "10",
-    "max_trade": "50",
+    "max_drawdown": "25",
+
     "day": "",
-    "day_equity": "20",
+    "day_start": "20",
     "day_blocked": "",
+
     "ai_day": "",
     "ai_calls": "0",
+
     "last_ai": "Нет решений",
     "last_cycle": "Никогда",
-    "last_price": "0"
+
+    "status": "Ожидание"
+
 }
 
 
 async def init_db():
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB) as db:
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS settings(
@@ -192,11 +231,19 @@ async def init_db():
         """)
 
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS positions(
+                symbol TEXT PRIMARY KEY,
+                quantity TEXT NOT NULL,
+                cost TEXT NOT NULL
+            )
+        """)
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS trades(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
                 side TEXT,
                 amount REAL,
-                price REAL,
                 pnl REAL,
                 created_at TEXT
             )
@@ -217,7 +264,7 @@ async def init_db():
 
 async def get(key):
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB) as db:
 
         async with db.execute(
             "SELECT value FROM settings WHERE key=?",
@@ -231,117 +278,240 @@ async def get(key):
 
 async def put(key, value):
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_lock:
 
-        await db.execute(
-            """
-            INSERT INTO settings(key,value)
-            VALUES (?,?)
-            ON CONFLICT(key)
-            DO UPDATE SET value=excluded.value
-            """,
-            (key, str(value))
-        )
+        async with aiosqlite.connect(DB) as db:
 
-        await db.commit()
-
-
-async def number(key):
-
-    return float(await get(key))
-
-
-async def save_trade(
-    side,
-    amount,
-    price,
-    pnl
-):
-
-    async with aiosqlite.connect(DB_PATH) as db:
-
-        await db.execute(
-            """
-            INSERT INTO trades
-            (side,amount,price,pnl,created_at)
-            VALUES (?,?,?,?,?)
-            """,
-            (
-                side,
-                amount,
-                price,
-                pnl,
-                datetime.now(
-                    timezone.utc
-                ).isoformat()
+            await db.execute(
+                """
+                INSERT INTO settings(key,value)
+                VALUES (?,?)
+                ON CONFLICT(key)
+                DO UPDATE SET value=excluded.value
+                """,
+                (key, str(value))
             )
-        )
 
-        await db.commit()
+            await db.commit()
 
 
-# ==========================================
+async def num(key):
+
+    return Decimal(await get(key))
+
+
+async def positions():
+
+    async with aiosqlite.connect(DB) as db:
+
+        async with db.execute(
+            "SELECT symbol,quantity,cost FROM positions"
+        ) as cursor:
+
+            rows = await cursor.fetchall()
+
+    return {
+        row[0]: {
+            "quantity": Decimal(row[1]),
+            "cost": Decimal(row[2])
+        }
+        for row in rows
+    }
+
+
+# =========================================
 # HTTP
-# ==========================================
+# =========================================
 
 async def request_json(
+    method,
     url,
+    params=None,
     payload=None,
     headers=None
 ):
 
     timeout = aiohttp.ClientTimeout(
-        total=45
+        total=35
     )
 
-    if payload is None:
-
-        async with http.get(
-            url,
-            timeout=timeout,
-            headers=headers
-        ) as response:
-
-            response.raise_for_status()
-
-            return await response.json()
-
-    async with http.post(
+    async with http.request(
+        method,
         url,
+        params=params,
         json=payload,
         headers=headers,
         timeout=timeout
     ) as response:
 
-        response.raise_for_status()
+        text = await response.text()
 
-        return await response.json()
+        if response.status >= 400:
+
+            raise RuntimeError(
+                f"HTTP {response.status}: "
+                f"{text[:250]}"
+            )
+
+        try:
+            return json.loads(text)
+
+        except json.JSONDecodeError:
+
+            raise RuntimeError(
+                "API вернул некорректный JSON"
+            )
 
 
-# ==========================================
-# BASE BLOCKCHAIN
-# ==========================================
+# =========================================
+# 0X API
+# =========================================
 
-async def check_base():
+def raw_amount(symbol, amount):
+
+    decimals = TOKENS[symbol]["decimals"]
+
+    value = Decimal(str(amount))
+
+    if not value.is_finite() or value <= 0:
+        raise ValueError(
+            "Некорректная сумма"
+        )
+
+    return str(
+        int(value * (10 ** decimals))
+    )
+
+
+def human_amount(symbol, amount):
+
+    decimals = TOKENS[symbol]["decimals"]
+
+    return (
+        Decimal(str(amount))
+        / Decimal(10 ** decimals)
+    )
+
+
+async def quote_price(
+    sell_symbol,
+    buy_symbol,
+    amount
+):
+
+    if sell_symbol == buy_symbol:
+        raise ValueError(
+            "Одинаковые токены"
+        )
+
+    if sell_symbol not in TOKENS:
+        raise ValueError(
+            "Неизвестный токен"
+        )
+
+    if buy_symbol not in TOKENS:
+        raise ValueError(
+            "Неизвестный токен"
+        )
+
+    headers = {
+        "0x-api-key": ZEROX_KEY,
+        "0x-version": "v2"
+    }
+
+    params = {
+        "chainId": CHAIN_ID,
+
+        "sellToken": (
+            TOKENS[sell_symbol]["address"]
+        ),
+
+        "buyToken": (
+            TOKENS[buy_symbol]["address"]
+        ),
+
+        "sellAmount": raw_amount(
+            sell_symbol,
+            amount
+        ),
+
+        "taker": WALLET
+    }
+
+    result = await request_json(
+        "GET",
+        ZEROX_API + "/price",
+        params=params,
+        headers=headers
+    )
+
+    if result.get("liquidityAvailable") is False:
+
+        raise RuntimeError(
+            "0x: недостаточно ликвидности"
+        )
+
+    buy_amount = result.get(
+        "buyAmount"
+    )
+
+    if not buy_amount:
+        raise RuntimeError(
+            "0x не вернул buyAmount"
+        )
+
+    received = human_amount(
+        buy_symbol,
+        buy_amount
+    )
+
+    if received <= 0:
+        raise RuntimeError(
+            "Некорректная котировка"
+        )
+
+    return {
+        "sell": sell_symbol,
+        "buy": buy_symbol,
+        "amount": Decimal(str(amount)),
+        "received": received,
+        "raw": result
+    }
+
+
+# =========================================
+# BASE WALLET
+# =========================================
+
+ERC20_ABI = [
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [
+            {
+                "name": "owner",
+                "type": "address"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "",
+                "type": "uint256"
+            }
+        ]
+    }
+]
+
+
+async def wallet_balance():
 
     chain = await web3.eth.chain_id
 
     if chain != CHAIN_ID:
 
         raise RuntimeError(
-            f"Неверная сеть: {chain}"
-        )
-
-    return True
-
-
-async def eth_balance():
-
-    await check_base()
-
-    if not AsyncWeb3.is_address(WALLET):
-        raise RuntimeError(
-            "Неверный WALLET_ADDRESS"
+            "Неверная сеть"
         )
 
     address = AsyncWeb3.to_checksum_address(
@@ -352,238 +522,265 @@ async def eth_balance():
         address
     )
 
-    return float(
-        web3.from_wei(wei, "ether")
-    )
-
-
-ERC20_ABI = [
-    {
-        "constant": True,
-        "inputs": [
-            {
-                "name": "owner",
-                "type": "address"
-            }
-        ],
-        "name": "balanceOf",
-        "outputs": [
-            {
-                "name": "",
-                "type": "uint256"
-            }
-        ],
-        "type": "function"
+    result = {
+        "ETH": Decimal(
+            str(web3.from_wei(wei, "ether"))
+        )
     }
-]
+
+    for symbol, token in TOKENS.items():
+
+        contract = web3.eth.contract(
+            address=AsyncWeb3.to_checksum_address(
+                token["address"]
+            ),
+            abi=ERC20_ABI
+        )
+
+        value = await contract.functions.balanceOf(
+            address
+        ).call()
+
+        result[symbol] = human_amount(
+            symbol,
+            value
+        )
+
+    return result
 
 
-async def usdc_balance():
+# =========================================
+# PORTFOLIO
+# =========================================
 
-    await check_base()
+async def get_equity():
 
-    if not AsyncWeb3.is_address(WALLET):
+    cash = await num("cash")
+
+    active = await positions()
+
+    equity = cash
+
+    for symbol, position in active.items():
+
+        quote = await quote_price(
+            symbol,
+            "USDC",
+            position["quantity"]
+        )
+
+        equity += (
+            quote["received"]
+            * (1 - SIMULATION_COST)
+        )
+
+    return equity
+
+
+async def risk_status():
+
+    today = datetime.now(
+        timezone.utc
+    ).date().isoformat()
+
+    equity = await get_equity()
+
+    if await get("day") != today:
+
+        await put("day", today)
+
+        await put(
+            "day_start",
+            equity
+        )
+
+        await put(
+            "day_blocked",
+            ""
+        )
+
+    start = await num("day_start")
+
+    initial = await num("initial")
+
+    daily_limit = await num(
+        "daily_limit"
+    )
+
+    drawdown_limit = await num(
+        "max_drawdown"
+    )
+
+    if start <= 0 or initial <= 0:
         raise RuntimeError(
-            "Неверный WALLET_ADDRESS"
+            "Некорректный баланс"
         )
 
-    contract = web3.eth.contract(
-        address=USDC,
-        abi=ERC20_ABI
+    daily_loss = (
+        (start - equity)
+        / start
+        * 100
     )
 
-    value = await contract.functions.balanceOf(
-        AsyncWeb3.to_checksum_address(WALLET)
-    ).call()
-
-    return value / 1_000_000
-
-
-# ==========================================
-# MARKET DATA
-# ==========================================
-
-async def get_market():
-
-    # DexScreener предоставляет ориентировочные
-    # рыночные данные, а не исполняемую
-    # котировку Aerodrome.
-
-    url = (
-        "https://api.dexscreener.com/"
-        "token-pairs/v1/base/"
-        + WETH
+    drawdown = (
+        (initial - equity)
+        / initial
+        * 100
     )
-
-    data = await request_json(url)
-
-    if not isinstance(data, list):
-        raise RuntimeError(
-            "Нет данных DexScreener"
-        )
-
-    pairs = []
-
-    for pair in data:
-
-        if str(
-            pair.get("chainId", "")
-        ).lower() != "base":
-            continue
-
-        base = pair.get(
-            "baseToken", {}
-        ).get("address", "")
-
-        quote = pair.get(
-            "quoteToken", {}
-        ).get("address", "")
-
-        addresses = {
-            base.lower(),
-            quote.lower()
-        }
-
-        if addresses != {
-            WETH.lower(),
-            USDC.lower()
-        }:
-            continue
-
-        # Принимаем только пулы Aerodrome
-        dex = str(
-            pair.get("dexId", "")
-        ).lower()
-
-        if "aerodrome" not in dex:
-            continue
-
-        liquidity = float(
-            (pair.get("liquidity") or {})
-            .get("usd") or 0
-        )
-
-        if liquidity < 100000:
-            continue
-
-        volume = float(
-            (pair.get("volume") or {})
-            .get("h24") or 0
-        )
-
-        pairs.append(
-            (liquidity, volume, pair)
-        )
-
-    if not pairs:
-
-        raise RuntimeError(
-            "Ликвидный пул WETH/USDC "
-            "на Aerodrome не найден"
-        )
-
-    pairs.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    _, volume, pair = pairs[0]
-
-    # DexScreener priceUsd относится
-    # к baseToken. Если baseToken — USDC,
-    # берём обратную цену.
-    base_address = pair[
-        "baseToken"
-    ]["address"].lower()
-
-    usd_price = float(
-        pair["priceUsd"]
-    )
-
-    if base_address == WETH.lower():
-
-        price = usd_price
-
-    else:
-
-        price = 1 / usd_price
 
     if (
-        not math.isfinite(price)
-        or price <= 0
+        daily_loss >= daily_limit
+        or drawdown >= drawdown_limit
     ):
-        raise RuntimeError(
-            "Некорректная цена"
+
+        await put(
+            "day_blocked",
+            today
         )
 
-    changes = pair.get(
-        "priceChange"
-    ) or {}
+        await put(
+            "autopilot",
+            "OFF"
+        )
+
+    blocked = (
+        await get("day_blocked")
+        == today
+    )
 
     return {
-        "symbol": "WETH/USDC",
-        "price": price,
-        "change_5m": float(
-            changes.get("m5") or 0
-        ),
-        "change_1h": float(
-            changes.get("h1") or 0
-        ),
-        "change_24h": float(
-            changes.get("h24") or 0
-        ),
-        "liquidity": pairs[0][0],
-        "volume_24h": volume,
-        "dex": pair.get("dexId"),
-        "pair_address": pair.get(
-            "pairAddress"
-        )
+        "equity": equity,
+        "daily_loss": daily_loss,
+        "drawdown": drawdown,
+        "blocked": blocked
     }
 
 
-# ==========================================
-# OPENROUTER
-# ==========================================
+# =========================================
+# AI
+# =========================================
 
-async def ask_ai(
-    system_prompt,
-    data
-):
+ANALYST = """
+Ты трейдер экспериментального
+криптовалютного бота.
 
-    if not AI_KEY:
+Торговля только DEMO.
+
+Используй предоставленные котировки.
+
+Не придумывай технические индикаторы,
+новости или дополнительные данные.
+
+Выбирай одно действие:
+BUY, SELL или HOLD.
+
+Выбирай только разрешённый символ.
+
+Ответ строго JSON:
+
+{
+ "action": "HOLD",
+ "symbol": "WETH",
+ "amount_usd": 3,
+ "reason": "Краткое объяснение"
+}
+
+Если данных недостаточно, выбирай HOLD.
+"""
+
+
+CRITIC = """
+Ты независимый риск-аналитик.
+
+Проверяй предложение первого агента.
+
+Используй баланс, ограничения
+и полученные котировки.
+
+Возможные решения:
+
+APPROVE
+MODIFY
+REJECT
+
+При MODIFY можно уменьшить сумму.
+
+Не одобряй сделки только ради активности.
+
+Ответ строго JSON:
+
+{
+ "decision": "REJECT",
+ "amount_usd": 0,
+ "reason": "Краткое объяснение"
+}
+
+Если данных недостаточно,
+выбирай REJECT.
+"""
+
+
+async def ai_budget():
+
+    today = datetime.now(
+        timezone.utc
+    ).date().isoformat()
+
+    if await get("ai_day") != today:
+
+        await put("ai_day", today)
+
+        await put("ai_calls", 0)
+
+    return int(
+        await get("ai_calls")
+    )
+
+
+async def ask_ai(prompt, data):
+
+    calls = await ai_budget()
+
+    if calls >= MAX_AI_CALLS:
+
         raise RuntimeError(
-            "Нет OPENROUTER_API_KEY"
+            "Дневной лимит ИИ достигнут"
         )
 
+    await put(
+        "ai_calls",
+        calls + 1
+    )
+
     payload = {
-        "model": AI_MODEL,
+        "model": MODEL,
+
         "messages": [
             {
                 "role": "system",
-                "content": system_prompt
+                "content": prompt
             },
             {
                 "role": "user",
                 "content": json.dumps(
                     data,
-                    ensure_ascii=False
+                    ensure_ascii=False,
+                    default=str
                 )
             }
         ],
+
         "temperature": 0.1,
-        "max_tokens": 1200
+        "max_tokens": 1000
     }
 
     result = await request_json(
-        "https://openrouter.ai/api/v1/"
-        "chat/completions",
-        payload,
-        {
+        "POST",
+        "https://openrouter.ai/api/v1/chat/completions",
+        payload=payload,
+        headers={
             "Authorization": (
-                "Bearer " + AI_KEY
-            ),
-            "Content-Type": (
-                "application/json"
+                "Bearer " + OPENROUTER_KEY
             )
         }
     )
@@ -594,7 +791,7 @@ async def ask_ai(
 
     if not choices:
         raise RuntimeError(
-            "OpenRouter: нет choices"
+            "ИИ не вернул choices"
         )
 
     content = (
@@ -603,12 +800,9 @@ async def ask_ai(
         .get("content")
     )
 
-    if not isinstance(
-        content, str
-    ) or not content.strip():
-
+    if not isinstance(content, str):
         raise RuntimeError(
-            "OpenRouter: пустой ответ"
+            "Пустой ответ ИИ"
         )
 
     start = content.find("{")
@@ -625,299 +819,176 @@ async def ask_ai(
     )
 
     if not isinstance(answer, dict):
+
         raise RuntimeError(
-            "Неверный формат ответа ИИ"
+            "Неверный ответ ИИ"
         )
 
     return answer
 
 
-ANALYST_PROMPT = """
-Ты трейдер экспериментального
-криптовалютного DEMO-бота.
+# =========================================
+# MARKET SCANNER
+# =========================================
 
-Торговая пара WETH/USDC.
+async def scan_market():
 
-Используй только полученные данные.
-Не придумывай индикаторы или новости.
+    result = {}
 
-При отсутствии позиции:
-BUY или HOLD.
+    for symbol in TRADE_TOKENS:
 
-При открытой позиции:
-SELL или HOLD.
+        try:
 
-Не открывай сделки ради активности.
+            quote = await quote_price(
+                "USDC",
+                symbol,
+                5
+            )
 
-Ответ строго JSON:
+            result[symbol] = {
+                "usdc_spent": 5,
+                "quantity": str(
+                    quote["received"]
+                )
+            }
 
-{
- "action": "HOLD",
- "percent": 25,
- "reason": "Краткое объяснение"
-}
-"""
+        except Exception as error:
 
+            logger.warning(
+                "Quote error %s: %s",
+                symbol,
+                str(error)[:150]
+            )
 
-CRITIC_PROMPT = """
-Ты независимый риск-аналитик.
+    if not result:
 
-Твоя задача — объективно проверить
-предложение трейдера.
-
-Тебе передают:
-баланс, комиссию, дневной лимит,
-размер позиции и данные рынка.
-
-Не выдумывай отсутствующие данные.
-
-Не отклоняй сделку только потому,
-что не знаешь уже переданные лимиты.
-
-Но при существенной неопределённости
-или риске отклоняй предложение.
-
-Варианты:
-APPROVE — разрешить.
-MODIFY — уменьшить размер.
-REJECT — отклонить.
-
-Ответ строго JSON:
-
-{
- "decision": "REJECT",
- "percent": 0,
- "reason": "Краткое объяснение"
-}
-
-Для MODIFY percent означает
-новый процент свободного баланса.
-
-Для SELL изменение percent
-не используется.
-"""
-
-
-# ==========================================
-# PORTFOLIO
-# ==========================================
-
-async def portfolio(price):
-
-    cash = await number("cash")
-
-    qty = await number("quantity")
-
-    sale_value = (
-        qty
-        * price
-        * (1 - DEMO_FEE)
-        * (1 - DEMO_SLIPPAGE)
-    )
-
-    equity = cash + sale_value
-
-    return {
-        "cash": cash,
-        "quantity": qty,
-        "equity": equity,
-        "position": qty > 0
-    }
-
-
-async def check_daily_risk(price):
-
-    today = datetime.now(
-        timezone.utc
-    ).date().isoformat()
-
-    p = await portfolio(price)
-
-    equity = p["equity"]
-
-    last_day = await get("day")
-
-    if last_day != today:
-
-        await put(
-            "day",
-            today
-        )
-
-        await put(
-            "day_equity",
-            equity
-        )
-
-        await put(
-            "day_blocked",
-            ""
-        )
-
-    start = await number(
-        "day_equity"
-    )
-
-    limit = await number(
-        "daily_limit"
-    )
-
-    if start <= 0:
         raise RuntimeError(
-            "Неверный начальный капитал"
+            "0x не вернул котировки"
         )
 
-    loss = (
-        (start - equity)
-        / start
-        * 100
-    )
-
-    if loss >= limit:
-
-        await put(
-            "day_blocked",
-            today
-        )
-
-    blocked = (
-        await get("day_blocked")
-        == today
-    )
-
-    return {
-        "blocked": blocked,
-        "loss_percent": loss,
-        "limit": limit
-    }
+    return result
 
 
-# ==========================================
+# =========================================
 # DEMO EXECUTION
-# ==========================================
+# =========================================
 
-async def execute_demo(
-    action,
-    percent,
-    price
-):
+async def demo_buy(symbol, amount):
 
-    # Используем trade_lock для исключения
-    # одновременного исполнения торговых циклов.
+    amount = Decimal(str(amount))
+
+    if symbol not in TRADE_TOKENS:
+        return "Запрещённый токен"
+
+    if amount < MIN_TRADE:
+        return "Сумма меньше $2"
+
+    if amount > MAX_TRADE:
+        return "Сумма больше $5"
 
     if await get("autopilot") != "ON":
         return "Автопилот выключен"
 
     if await get("emergency") == "ON":
-        return "Аварийная остановка"
+        return "Аварийная блокировка"
 
-    risk = await check_daily_risk(
-        price
-    )
+    cash = await num("cash")
+
+    if cash < amount:
+        return "Недостаточно USDC"
+
+    active = await positions()
+
+    if symbol in active:
+        return "Позиция уже открыта"
+
+    risk = await risk_status()
 
     if risk["blocked"]:
-        return "Дневной лимит достигнут"
+        return "Лимит риска достигнут"
 
-    cash = await number("cash")
-    qty = await number("quantity")
+    quote = await quote_price(
+        "USDC",
+        symbol,
+        amount
+    )
 
-    if action == "BUY":
+    quantity = (
+        quote["received"]
+        * (1 - SIMULATION_COST)
+    )
 
-        if qty > 0:
-            return "Позиция уже открыта"
+    if await get("autopilot") != "ON":
+        return "Автопилот остановлен"
 
-        max_percent = await number(
-            "max_trade"
-        )
+    if await get("emergency") == "ON":
+        return "Аварийная блокировка"
 
-        strategy = await get(
-            "strategy"
-        )
+    async with db_lock:
 
-        if strategy == "SAFE":
-            max_percent = min(
-                max_percent, 25
-            )
-
-        if strategy == "AGGRESSIVE":
-            max_percent = min(
-                max_percent, 75
-            )
-
-        percent = min(
-            percent,
-            max_percent
-        )
-
-        amount = (
-            cash * percent / 100
-        )
-
-        if amount < MIN_DEMO_TRADE:
-            return "Маленький размер сделки"
-
-        quantity = (
-            amount
-            * (1 - DEMO_FEE)
-            * (1 - DEMO_SLIPPAGE)
-            / price
-        )
-
-        if quantity <= 0:
-            return "Неверное количество"
-
-        # Дополнительная проверка непосредственно
-        # перед изменением портфеля.
-        if await get("autopilot") != "ON":
-            return "Остановлено"
-
-        if await get("emergency") == "ON":
-            return "Заблокировано"
-
-        # Баланс, позиция и журнал
-        # сохраняются одной транзакцией.
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
+        async with aiosqlite.connect(DB) as db:
 
             await db.execute(
                 "BEGIN IMMEDIATE"
             )
 
+            cursor = await db.execute(
+                "SELECT value FROM settings WHERE key='cash'"
+            )
+
+            row = await cursor.fetchone()
+
+            current_cash = Decimal(row[0])
+
+            cursor = await db.execute(
+                "SELECT 1 FROM positions WHERE symbol=?",
+                (symbol,)
+            )
+
+            existing = await cursor.fetchone()
+
+            if (
+                current_cash < amount
+                or existing
+                or await get("autopilot") != "ON"
+                or await get("emergency") == "ON"
+            ):
+
+                await db.rollback()
+
+                return "Сделка заблокирована"
+
             await db.execute(
                 """
-                UPDATE settings SET value=?
+                UPDATE settings
+                SET value=?
                 WHERE key='cash'
                 """,
-                (str(cash - amount),)
+                (str(current_cash - amount),)
             )
 
             await db.execute(
                 """
-                UPDATE settings SET value=?
-                WHERE key='quantity'
+                INSERT INTO positions
+                VALUES (?,?,?)
                 """,
-                (str(quantity),)
-            )
-
-            await db.execute(
-                """
-                UPDATE settings SET value=?
-                WHERE key='entry_cost'
-                """,
-                (str(amount),)
+                (
+                    symbol,
+                    str(quantity),
+                    str(amount)
+                )
             )
 
             await db.execute(
                 """
                 INSERT INTO trades
-                (side,amount,price,pnl,created_at)
+                (symbol,side,amount,pnl,created_at)
                 VALUES (?,?,?,?,?)
                 """,
                 (
+                    symbol,
                     "BUY",
-                    amount,
-                    price,
+                    float(amount),
                     0,
                     datetime.now(
                         timezone.utc
@@ -927,84 +998,116 @@ async def execute_demo(
 
             await db.commit()
 
-        await bot.send_message(
-            ADMIN_ID,
-            "🟢 ДЕМО-ПОКУПКА\n\n"
-            "🪙 WETH/USDC\n"
-            f"💰 Сумма: ${amount:.2f}\n"
-            f"📊 Цена: ${price:.2f}\n"
-            f"🔢 WETH: {quantity:.8f}"
-        )
+    await bot.send_message(
+        ADMIN_ID,
+        "🟢 ДЕМО-ПОКУПКА\n\n"
+        f"🪙 {symbol}\n"
+        f"💰 Потрачено: ${amount}\n"
+        f"🔢 Получено: {quantity:.8f}\n"
+        "💱 Котировка: 0x"
+    )
 
-        return (
-            f"BUY ${amount:.2f}"
-        )
+    return f"BUY {symbol} ${amount}"
 
-    if action == "SELL":
 
-        if qty <= 0:
-            return "Нет позиции"
+async def demo_sell(symbol):
 
-        value = (
-            qty
-            * price
-            * (1 - DEMO_FEE)
-            * (1 - DEMO_SLIPPAGE)
-        )
+    if symbol not in TRADE_TOKENS:
+        return "Запрещённый токен"
 
-        cost = await number(
-            "entry_cost"
-        )
+    if await get("autopilot") != "ON":
+        return "Автопилот выключен"
 
-        pnl = value - cost
+    if await get("emergency") == "ON":
+        return "Аварийная блокировка"
 
-        if await get("autopilot") != "ON":
-            return "Остановлено"
+    active = await positions()
 
-        if await get("emergency") == "ON":
-            return "Заблокировано"
+    if symbol not in active:
+        return "Позиция отсутствует"
 
-        async with aiosqlite.connect(
-            DB_PATH
-        ) as db:
+    position = active[symbol]
+
+    quote = await quote_price(
+        symbol,
+        "USDC",
+        position["quantity"]
+    )
+
+    received = (
+        quote["received"]
+        * (1 - SIMULATION_COST)
+    )
+
+    pnl = (
+        received - position["cost"]
+    )
+
+    if await get("autopilot") != "ON":
+        return "Автопилот остановлен"
+
+    if await get("emergency") == "ON":
+        return "Аварийная блокировка"
+
+    async with db_lock:
+
+        async with aiosqlite.connect(DB) as db:
 
             await db.execute(
                 "BEGIN IMMEDIATE"
             )
 
+            cursor = await db.execute(
+                "SELECT quantity,cost FROM positions WHERE symbol=?",
+                (symbol,)
+            )
+
+            row = await cursor.fetchone()
+
+            if (
+                not row
+                or Decimal(row[0]) != position["quantity"]
+                or await get("autopilot") != "ON"
+                or await get("emergency") == "ON"
+            ):
+
+                await db.rollback()
+
+                return "Сделка заблокирована"
+
+            cursor = await db.execute(
+                "SELECT value FROM settings WHERE key='cash'"
+            )
+
+            cash = Decimal(
+                (await cursor.fetchone())[0]
+            )
+
             await db.execute(
                 """
-                UPDATE settings SET value=?
+                UPDATE settings
+                SET value=?
                 WHERE key='cash'
                 """,
-                (str(cash + value),)
+                (str(cash + received),)
             )
 
             await db.execute(
-                """
-                UPDATE settings SET value='0'
-                WHERE key='quantity'
-                """
-            )
-
-            await db.execute(
-                """
-                UPDATE settings SET value='0'
-                WHERE key='entry_cost'
-                """
+                "DELETE FROM positions WHERE symbol=?",
+                (symbol,)
             )
 
             await db.execute(
                 """
                 INSERT INTO trades
-                (side,amount,price,pnl,created_at)
+                (symbol,side,amount,pnl,created_at)
                 VALUES (?,?,?,?,?)
                 """,
                 (
+                    symbol,
                     "SELL",
-                    value,
-                    price,
-                    pnl,
+                    float(received),
+                    float(pnl),
                     datetime.now(
                         timezone.utc
                     ).isoformat()
@@ -1013,70 +1116,22 @@ async def execute_demo(
 
             await db.commit()
 
-        await bot.send_message(
-            ADMIN_ID,
-            "🔴 ДЕМО-ПРОДАЖА\n\n"
-            "🪙 WETH/USDC\n"
-            f"💰 Получено: ${value:.2f}\n"
-            f"📈 PNL: ${pnl:+.4f}"
-        )
-
-        return (
-            f"SELL PNL ${pnl:+.4f}"
-        )
-
-    return "HOLD"
-
-
-# ==========================================
-# AI BUDGET
-# ==========================================
-
-async def ai_budget():
-
-    today = datetime.now(
-        timezone.utc
-    ).date().isoformat()
-
-    if await get("ai_day") != today:
-
-        await put("ai_day", today)
-        await put("ai_calls", 0)
-
-    return int(
-        await number("ai_calls")
+    await bot.send_message(
+        ADMIN_ID,
+        "🔴 ДЕМО-ПРОДАЖА\n\n"
+        f"🪙 {symbol}\n"
+        f"💰 Получено: ${received:.4f}\n"
+        f"📈 PNL: ${pnl:+.4f}"
     )
 
-
-async def counted_ai(prompt, data):
-
-    calls = await ai_budget()
-
-    if calls >= MAX_DAILY_AI_CALLS:
-
-        raise RuntimeError(
-            "Дневной лимит запросов ИИ"
-        )
-
-    await put(
-        "ai_calls",
-        calls + 1
-    )
-
-    return await ask_ai(
-        prompt,
-        data
-    )
+    return f"SELL {symbol} PNL ${pnl:+.4f}"
 
 
-# ==========================================
+# =========================================
 # TRADING ENGINE
-# ==========================================
+# =========================================
 
 async def trading_cycle():
-
-    global last_ai_attempt
-    global last_ai_error
 
     if trade_lock.locked():
         return "Анализ уже выполняется"
@@ -1091,18 +1146,7 @@ async def trading_cycle():
 
         try:
 
-            market = await get_market()
-
-            price = market["price"]
-
-            await put(
-                "last_price",
-                price
-            )
-
-            risk = await check_daily_risk(
-                price
-            )
+            risk = await risk_status()
 
             if risk["blocked"]:
 
@@ -1113,93 +1157,82 @@ async def trading_cycle():
 
                 await bot.send_message(
                     ADMIN_ID,
-                    "🚨 Дневной лимит достигнут.\n"
-                    "Автопилот остановлен.\n"
-                    "Позиция остаётся открытой."
+                    "🚨 Лимит риска достигнут.\n"
+                    "Автопилот остановлен."
                 )
 
-                return "Лимит риска"
-
-            p = await portfolio(price)
-
-            now = time.time()
-
-            if (
-                now - last_ai_attempt
-                < AI_COOLDOWN
-            ):
-                return "Ожидание ИИ"
+                return "Риск-лимит"
 
             calls = await ai_budget()
 
-            if (
-                calls + 2
-                > MAX_DAILY_AI_CALLS
-            ):
+            if calls + 2 > MAX_AI_CALLS:
+
                 return "Лимит бесплатного ИИ"
 
-            last_ai_attempt = now
+            market = await scan_market()
 
-            strategy = await get(
-                "strategy"
-            )
+            active = await positions()
 
-            max_trade = await number(
-                "max_trade"
-            )
-
-            # Экономим бесплатные запросы.
-            # Без значимого движения рынка
-            # новые покупки не рассматриваем.
-            movement = abs(
-                market["change_1h"]
-            )
-
-            if (
-                not p["position"]
-                and movement < 0.4
-            ):
-                return (
-                    "HOLD: слабое движение рынка"
-                )
+            cash = await num("cash")
 
             context = {
                 "market": market,
-                "portfolio": p,
-                "strategy": strategy,
-                "max_trade_percent": max_trade,
-                "daily_loss_limit": (
-                    risk["limit"]
-                ),
-                "daily_loss_percent": (
-                    risk["loss_percent"]
-                ),
-                "fee_percent": (
-                    DEMO_FEE * 100
-                ),
-                "slippage_percent": (
-                    DEMO_SLIPPAGE * 100
-                ),
-                "mode": "DEMO"
+
+                "positions": {
+                    symbol: {
+                        "quantity": str(p["quantity"]),
+                        "cost": str(p["cost"])
+                    }
+                    for symbol, p in active.items()
+                },
+
+                "cash": str(cash),
+
+                "risk": {
+                    "daily_loss_percent": str(
+                        risk["daily_loss"]
+                    ),
+
+                    "drawdown_percent": str(
+                        risk["drawdown"]
+                    ),
+
+                    "daily_limit": str(
+                        await get("daily_limit")
+                    ),
+
+                    "max_drawdown": str(
+                        await get("max_drawdown")
+                    )
+                },
+
+                "min_trade": MIN_TRADE,
+                "max_trade": MAX_TRADE,
+
+                "strategy": await get(
+                    "strategy"
+                )
             }
 
-            analyst = await counted_ai(
-                ANALYST_PROMPT,
+            analyst = await ask_ai(
+                ANALYST,
                 context
             )
 
             action = str(
-                analyst.get(
-                    "action",
-                    "HOLD"
-                )
+                analyst.get("action", "HOLD")
             ).upper()
+
+            symbol = str(
+                analyst.get("symbol", "")
+            )
 
             if action not in (
                 "BUY",
                 "SELL",
                 "HOLD"
             ):
+
                 action = "HOLD"
 
             if action == "HOLD":
@@ -1207,21 +1240,16 @@ async def trading_cycle():
                 text = (
                     "🤖 Аналитик: HOLD\n"
                     + str(
-                        analyst.get(
-                            "reason", ""
-                        )
+                        analyst.get("reason", "")
                     )[:300]
                 )
 
-                await put(
-                    "last_ai",
-                    text
-                )
+                await put("last_ai", text)
 
                 return text
 
-            critic = await counted_ai(
-                CRITIC_PROMPT,
+            critic = await ask_ai(
+                CRITIC,
                 {
                     **context,
                     "proposal": analyst
@@ -1240,82 +1268,91 @@ async def trading_cycle():
                 "MODIFY",
                 "REJECT"
             ):
+
                 decision = "REJECT"
 
             result = "HOLD"
-
-            try:
-
-                percent = float(
-                    analyst.get(
-                        "percent", 0
-                    )
-                )
-
-                if not math.isfinite(percent):
-                    percent = 0
-
-            except (ValueError, TypeError):
-
-                percent = 0
-
-            if decision == "MODIFY":
-
-                try:
-
-                    new_percent = float(
-                        critic.get(
-                            "percent", 0
-                        )
-                    )
-
-                    if (
-                        math.isfinite(new_percent)
-                        and 0 < new_percent <= percent
-                    ):
-                        percent = new_percent
-
-                    else:
-                        decision = "REJECT"
-
-                except (ValueError, TypeError):
-
-                    decision = "REJECT"
 
             if decision in (
                 "APPROVE",
                 "MODIFY"
             ):
 
-                if (
-                    action == "BUY"
-                    and not p["position"]
-                    and percent > 0
-                ):
+                try:
 
-                    result = await execute_demo(
-                        "BUY",
-                        percent,
-                        price
+                    amount = Decimal(
+                        str(
+                            analyst.get(
+                                "amount_usd", 0
+                            )
+                        )
                     )
 
-                elif (
-                    action == "SELL"
-                    and p["position"]
+                    if decision == "MODIFY":
+
+                        modified = Decimal(
+                            str(
+                                critic.get(
+                                    "amount_usd", 0
+                                )
+                            )
+                        )
+
+                        if (
+                            modified <= 0
+                            or modified > amount
+                        ):
+                            raise ValueError(
+                                "Неверное изменение суммы"
+                            )
+
+                        amount = modified
+
+                    if not amount.is_finite():
+                        raise ValueError(
+                            "Некорректная сумма"
+                        )
+
+                    if (
+                        action == "BUY"
+                        and symbol in TRADE_TOKENS
+                    ):
+
+                        result = await demo_buy(
+                            symbol,
+                            amount
+                        )
+
+                    elif (
+                        action == "SELL"
+                        and symbol in active
+                    ):
+
+                        result = await demo_sell(
+                            symbol
+                        )
+
+                except (
+                    ValueError,
+                    InvalidOperation
                 ):
 
-                    result = await execute_demo(
-                        "SELL",
-                        100,
-                        price
+                    result = (
+                        "Некорректная сумма ИИ"
                     )
 
             text = (
                 "🧠 СОВЕЩАНИЕ ИИ\n\n"
+
                 f"🤖 Аналитик: {action}\n"
+                f"🪙 Монета: {symbol}\n"
+
                 f"💬 {str(analyst.get('reason', ''))[:300]}\n\n"
+
                 f"🛡️ Критик: {decision}\n"
+
                 f"💬 {str(critic.get('reason', ''))[:300]}\n\n"
+
                 f"⚖️ Итог: {result}"
             )
 
@@ -1333,8 +1370,6 @@ async def trading_cycle():
                 )
             )
 
-            last_ai_error = ""
-
             await bot.send_message(
                 ADMIN_ID,
                 text[:4000]
@@ -1345,21 +1380,18 @@ async def trading_cycle():
         except Exception as error:
 
             logger.exception(
-                "Trading cycle failed"
+                "Trading error"
             )
 
-            last_ai_error = str(error)[:300]
-
-            # При ошибке ничего не покупаем.
             return (
                 "Ошибка анализа: "
-                + last_ai_error
+                + str(error)[:400]
             )
 
 
-# ==========================================
+# =========================================
 # KEYBOARDS
-# ==========================================
+# =========================================
 
 def kb(rows):
 
@@ -1385,16 +1417,16 @@ def main_kb():
             ("🛑 Остановить", "stop")
         ],
         [
-            ("💰 Демо-баланс", "balance"),
+            ("💰 Портфель", "portfolio"),
             ("👛 MetaMask", "wallet")
         ],
         [
-            ("📊 Статистика", "stats"),
-            ("💼 Позиция", "position")
+            ("💼 Позиции", "positions"),
+            ("📊 Статистика", "stats")
         ],
         [
             ("🧠 ИИ-агенты", "agents"),
-            ("📈 Рынок Base", "market")
+            ("💱 Проверить 0x", "test_0x")
         ],
         [
             ("🔍 Анализ сейчас", "analyze")
@@ -1411,27 +1443,21 @@ def main_kb():
 def back():
 
     return kb([
-        [
-            ("🔙 Главное меню", "menu")
-        ]
+        [("🔙 Главное меню", "menu")]
     ])
 
 
-# ==========================================
-# MENU
-# ==========================================
+# =========================================
+# TELEGRAM
+# =========================================
 
-async def main_text():
+async def menu_text():
 
-    cash = await number("cash")
+    cash = await num("cash")
 
     auto = await get("autopilot")
 
     emergency = await get("emergency")
-
-    interval = await get("interval")
-
-    strategy = await get("strategy")
 
     status = (
         "🟢 ВКЛ"
@@ -1443,549 +1469,395 @@ async def main_text():
         status = "🚨 БЛОКИРОВКА"
 
     return (
-        "🤖 AI CRYPTO TRADER v1.3\n\n"
-        "🌐 Сеть: BASE\n"
-        "💱 DEX: Aerodrome\n"
-        "🪙 Пара: WETH/USDC\n\n"
+        "🤖 AI CRYPTO TRADER v2.0\n\n"
+
+        "🌐 Сеть: Base\n"
+        "💱 Агрегатор: 0x\n"
+
+        "🪙 WETH / cbBTC / AERO\n\n"
+
         f"💰 Свободно: ${cash:.2f}\n"
-        f"📊 Стратегия: {strategy}\n"
         f"⚡ Автопилот: {status}\n"
-        f"⏰ Интервал: {interval} мин\n\n"
+
+        f"⏰ Интервал: "
+        f"{await get('interval')} мин\n"
+
+        "💵 Сделка: $2–5\n"
+
+        f"📉 Дневной лимит: "
+        f"{await get('daily_limit')}%\n\n"
+
         "🧠 Два ИИ-агента\n"
-        "💵 Торговля: DEMO\n"
-        "👛 MetaMask: только чтение\n\n"
-        "Выбери действие:"
+
+        "💰 Режим: DEMO\n"
+        "🔐 MetaMask: только чтение"
     )
 
 
 @dp.message(CommandStart())
 async def start(message: Message):
 
+    if message.from_user.id != ADMIN_ID:
+        return
+
     await message.answer(
-        await main_text(),
+        await menu_text(),
         reply_markup=main_kb()
     )
 
 
-@dp.callback_query(F.data == "menu")
-async def menu(c: CallbackQuery):
+@dp.callback_query()
+async def callbacks(c: CallbackQuery):
 
-    await c.message.edit_text(
-        await main_text(),
-        reply_markup=main_kb()
-    )
-
-    await c.answer()
-
-
-# ==========================================
-# AUTOPILOT
-# ==========================================
-
-@dp.callback_query(F.data == "run")
-async def run(c: CallbackQuery):
-
-    if await get("emergency") == "ON":
+    if c.from_user.id != ADMIN_ID:
 
         await c.answer(
-            "Сначала сними блокировку",
+            "Нет доступа",
             show_alert=True
         )
 
         return
 
-    await put(
-        "autopilot",
-        "ON"
-    )
-
-    await c.message.edit_text(
-        "🚀 ДЕМО-АВТОПИЛОТ ВКЛЮЧЁН\n\n"
-        "ИИ самостоятельно анализирует рынок.\n"
-        "Все сделки виртуальные.",
-        reply_markup=back()
-    )
-
-    await c.answer()
-
-
-@dp.callback_query(F.data == "stop")
-async def stop(c: CallbackQuery):
-
-    await put(
-        "autopilot",
-        "OFF"
-    )
-
-    await c.message.edit_text(
-        "🛑 Автопилот выключен.\n"
-        "Новые сделки заблокированы.",
-        reply_markup=back()
-    )
-
-    await c.answer()
-
-
-@dp.callback_query(F.data == "emergency")
-async def emergency(c: CallbackQuery):
-
-    await put(
-        "autopilot",
-        "OFF"
-    )
-
-    await put(
-        "emergency",
-        "ON"
-    )
-
-    await c.message.edit_text(
-        "🚨 АВАРИЙНАЯ ОСТАНОВКА\n\n"
-        "Новые сделки запрещены.\n"
-        "Открытая демопозиция сохраняется.",
-        reply_markup=kb([
-            [
-                ("🔓 Разблокировать", "unlock")
-            ],
-            [
-                ("🔙 Меню", "menu")
-            ]
-        ])
-    )
-
-    await c.answer()
-
-
-@dp.callback_query(F.data == "unlock")
-async def unlock(c: CallbackQuery):
-
-    await put(
-        "emergency",
-        "OFF"
-    )
-
-    await c.message.edit_text(
-        "✅ Блокировка снята.\n"
-        "Автопилот остаётся выключенным.",
-        reply_markup=back()
-    )
-
-    await c.answer()
-
-
-# ==========================================
-# WALLET
-# ==========================================
-
-@dp.callback_query(F.data == "wallet")
-async def wallet_handler(c: CallbackQuery):
-
-    await c.answer(
-        "Проверяю Base..."
-    )
-
-    try:
-
-        eth = await eth_balance()
-        usdc = await usdc_balance()
-
-        text = (
-            "👛 METAMASK — BASE\n\n"
-            f"📍 Адрес: {WALLET[:8]}...{WALLET[-6:]}\n\n"
-            f"⛽ ETH: {eth:.8f}\n"
-            f"💵 USDC: {usdc:.6f}\n\n"
-            "✅ Подключение успешно.\n"
-            "🔐 Доступ: только чтение.\n"
-            "❌ Реальные сделки выключены."
-        )
-
-    except Exception as error:
-
-        text = (
-            "❌ Ошибка Base:\n"
-            + str(error)[:500]
-        )
-
-    await c.message.answer(
-        text,
-        reply_markup=back()
-    )
-
-
-# ==========================================
-# MARKET
-# ==========================================
-
-@dp.callback_query(F.data == "market")
-async def market_handler(c: CallbackQuery):
-
-    await c.answer(
-        "Получаю котировки..."
-    )
-
-    try:
-
-        m = await get_market()
-
-        text = (
-            "📈 AERODROME — BASE\n\n"
-            f"🪙 {m['symbol']}\n"
-            f"💰 Цена: ${m['price']:.2f}\n"
-            f"📊 5 минут: {m['change_5m']:+.2f}%\n"
-            f"📊 1 час: {m['change_1h']:+.2f}%\n"
-            f"📊 24 часа: {m['change_24h']:+.2f}%\n"
-            f"💧 Ликвидность: ${m['liquidity']:,.0f}\n"
-            f"📦 Объём 24ч: ${m['volume_24h']:,.0f}\n\n"
-            "⚠️ Цена ориентировочная, "
-            "не исполняемая котировка."
-        )
-
-    except Exception as error:
-
-        text = (
-            "❌ Ошибка рынка:\n"
-            + str(error)[:500]
-        )
-
-    await c.message.answer(
-        text,
-        reply_markup=back()
-    )
-
-
-# ==========================================
-# BALANCE
-# ==========================================
-
-@dp.callback_query(F.data == "balance")
-async def balance_handler(c: CallbackQuery):
+    action = c.data
 
     await c.answer()
 
     try:
 
-        m = await get_market()
+        if action == "menu":
 
-        p = await portfolio(
-            m["price"]
-        )
+            await c.message.edit_text(
+                await menu_text(),
+                reply_markup=main_kb()
+            )
 
-        initial = await number(
-            "initial"
-        )
+        elif action == "run":
 
-        pnl = (
-            p["equity"] - initial
-        )
+            if await get("emergency") == "ON":
 
-        text = (
-            "💰 ДЕМО-ПОРТФЕЛЬ\n\n"
-            f"💵 USDC: ${p['cash']:.4f}\n"
-            f"🪙 WETH: {p['quantity']:.8f}\n"
-            f"🏦 Капитал: ${p['equity']:.4f}\n"
-            f"📈 PNL: ${pnl:+.4f}\n\n"
-            "⚠️ Виртуальные средства."
-        )
+                text = (
+                    "🚨 Сначала сними блокировку"
+                )
+
+            else:
+
+                await put(
+                    "autopilot",
+                    "ON"
+                )
+
+                text = (
+                    "🚀 ДЕМО-АВТОПИЛОТ ВКЛЮЧЁН\n\n"
+                    "ИИ анализирует рынок.\n"
+                    "Реальные деньги не используются."
+                )
+
+            await c.message.answer(
+                text,
+                reply_markup=back()
+            )
+
+        elif action == "stop":
+
+            await put(
+                "autopilot",
+                "OFF"
+            )
+
+            await c.message.answer(
+                "🛑 Автопилот выключен.",
+                reply_markup=back()
+            )
+
+        elif action == "emergency":
+
+            await put(
+                "autopilot",
+                "OFF"
+            )
+
+            await put(
+                "emergency",
+                "ON"
+            )
+
+            await c.message.answer(
+                "🚨 АВАРИЙНАЯ БЛОКИРОВКА\n\n"
+                "Новые сделки запрещены.",
+                reply_markup=kb([
+                    [
+                        ("🔓 Разблокировать", "unlock")
+                    ],
+                    [
+                        ("🔙 Меню", "menu")
+                    ]
+                ])
+            )
+
+        elif action == "unlock":
+
+            await put(
+                "emergency",
+                "OFF"
+            )
+
+            await c.message.answer(
+                "✅ Блокировка снята.\n"
+                "Автопилот выключен.",
+                reply_markup=back()
+            )
+
+        elif action == "wallet":
+
+            balances = await wallet_balance()
+
+            text = (
+                "👛 METAMASK — BASE\n\n"
+                f"📍 {WALLET[:8]}...{WALLET[-6:]}\n\n"
+            )
+
+            for symbol, amount in balances.items():
+
+                text += (
+                    f"{symbol}: {amount:.8f}\n"
+                )
+
+            text += (
+                "\n🔐 Доступ только на чтение."
+            )
+
+            await c.message.answer(
+                text,
+                reply_markup=back()
+            )
+
+        elif action == "test_0x":
+
+            quote = await quote_price(
+                "USDC",
+                "WETH",
+                5
+            )
+
+            await c.message.answer(
+                "✅ 0x API РАБОТАЕТ\n\n"
+                "💰 Продать: 5 USDC\n"
+                f"🪙 Получить: "
+                f"{quote['received']:.8f} WETH\n\n"
+                "⚠️ Это ориентировочная котировка, "
+                "не гарантия исполнения.",
+                reply_markup=back()
+            )
+
+        elif action == "portfolio":
+
+            cash = await num("cash")
+
+            equity = await get_equity()
+
+            initial = await num("initial")
+
+            await c.message.answer(
+                "💰 ДЕМО-ПОРТФЕЛЬ\n\n"
+                f"💵 Свободно: ${cash:.4f}\n"
+                f"🏦 Капитал: ${equity:.4f}\n"
+                f"📈 PNL: ${equity-initial:+.4f}\n\n"
+                "⚠️ Виртуальные средства.",
+                reply_markup=back()
+            )
+
+        elif action == "positions":
+
+            active = await positions()
+
+            if not active:
+
+                text = (
+                    "💼 Открытых позиций нет."
+                )
+
+            else:
+
+                text = "💼 ДЕМО-ПОЗИЦИИ\n\n"
+
+                for symbol, p in active.items():
+
+                    text += (
+                        f"🪙 {symbol}\n"
+                        f"Количество: "
+                        f"{p['quantity']:.8f}\n"
+                        f"Вложено: "
+                        f"${p['cost']:.2f}\n\n"
+                    )
+
+            await c.message.answer(
+                text,
+                reply_markup=back()
+            )
+
+        elif action == "stats":
+
+            async with aiosqlite.connect(DB) as db:
+
+                async with db.execute("""
+                    SELECT
+                        COUNT(*),
+                        COALESCE(SUM(pnl),0)
+                    FROM trades
+                    WHERE side='SELL'
+                """) as cursor:
+
+                    count, pnl = await cursor.fetchone()
+
+            await c.message.answer(
+                "📊 СТАТИСТИКА\n\n"
+                f"Закрытых сделок: {count}\n"
+                f"PNL: ${pnl:+.4f}\n"
+                f"Последний анализ: "
+                f"{await get('last_cycle')}",
+                reply_markup=back()
+            )
+
+        elif action == "agents":
+
+            calls = await ai_budget()
+
+            await c.message.answer(
+                "🧠 ИИ-АГЕНТЫ\n\n"
+                f"Модель: {MODEL}\n"
+                f"Запросов: {calls}/{MAX_AI_CALLS}\n\n"
+                f"{await get('last_ai')}",
+                reply_markup=back()
+            )
+
+        elif action == "analyze":
+
+            result = await trading_cycle()
+
+            await c.message.answer(
+                result[:4000],
+                reply_markup=back()
+            )
+
+        elif action == "settings":
+
+            await c.message.answer(
+                "⚙️ НАСТРОЙКИ\n\n"
+                f"Стратегия: {await get('strategy')}\n"
+                f"Интервал: {await get('interval')} мин\n"
+                f"Дневной лимит: "
+                f"{await get('daily_limit')}%\n\n"
+                "Выбери параметр:",
+                reply_markup=kb([
+                    [
+                        ("🟢 SAFE", "strategy_SAFE")
+                    ],
+                    [
+                        ("🤖 AUTO", "strategy_AUTO")
+                    ],
+                    [
+                        ("🔴 AGGRESSIVE", "strategy_AGGRESSIVE")
+                    ],
+                    [
+                        ("⏰ 5 минут", "interval_5")
+                    ],
+                    [
+                        ("⏰ 10 минут", "interval_10")
+                    ],
+                    [
+                        ("⏰ 15 минут", "interval_15")
+                    ],
+                    [
+                        ("📉 Лимит 5%", "loss_5")
+                    ],
+                    [
+                        ("📉 Лимит 10%", "loss_10")
+                    ],
+                    [
+                        ("📉 Лимит 20%", "loss_20")
+                    ],
+                    [
+                        ("🔙 Меню", "menu")
+                    ]
+                ])
+            )
+
+        elif action.startswith("strategy_"):
+
+            value = action.split("_", 1)[1]
+
+            if value in (
+                "SAFE",
+                "AUTO",
+                "AGGRESSIVE"
+            ):
+
+                await put(
+                    "strategy",
+                    value
+                )
+
+                await c.message.answer(
+                    f"✅ Стратегия: {value}",
+                    reply_markup=back()
+                )
+
+        elif action.startswith("interval_"):
+
+            value = action.split("_", 1)[1]
+
+            if value in (
+                "5",
+                "10",
+                "15"
+            ):
+
+                await put(
+                    "interval",
+                    value
+                )
+
+                await c.message.answer(
+                    f"✅ Интервал: {value} минут",
+                    reply_markup=back()
+                )
+
+        elif action.startswith("loss_"):
+
+            value = action.split("_", 1)[1]
+
+            if value in (
+                "5",
+                "10",
+                "20"
+            ):
+
+                await put(
+                    "daily_limit",
+                    value
+                )
+
+                await c.message.answer(
+                    f"✅ Дневной лимит: {value}%",
+                    reply_markup=back()
+                )
 
     except Exception as error:
 
-        text = (
-            "Ошибка оценки:\n"
-            + str(error)[:300]
+        logger.exception(
+            "Telegram handler error"
         )
 
-    await c.message.answer(
-        text,
-        reply_markup=back()
-    )
-
-
-# ==========================================
-# POSITION
-# ==========================================
-
-@dp.callback_query(F.data == "position")
-async def position_handler(c: CallbackQuery):
-
-    qty = await number(
-        "quantity"
-    )
-
-    if qty <= 0:
-
-        text = (
-            "💼 Открытых позиций нет."
+        await c.message.answer(
+            "❌ Ошибка:\n"
+            + str(error)[:400],
+            reply_markup=back()
         )
 
-    else:
 
-        text = (
-            "💼 ДЕМО-ПОЗИЦИЯ\n\n"
-            "🪙 WETH/USDC\n"
-            f"🔢 Количество: {qty:.8f}\n"
-            f"💰 Вложено: "
-            f"${await number('entry_cost'):.4f}"
-        )
-
-    await c.message.edit_text(
-        text,
-        reply_markup=back()
-    )
-
-    await c.answer()
-
-
-# ==========================================
-# STATISTICS
-# ==========================================
-
-@dp.callback_query(F.data == "stats")
-async def stats_handler(c: CallbackQuery):
-
-    async with aiosqlite.connect(
-        DB_PATH
-    ) as db:
-
-        async with db.execute("""
-            SELECT COUNT(*),
-                   COALESCE(SUM(pnl),0)
-            FROM trades
-            WHERE side='SELL'
-        """) as cursor:
-
-            count, pnl = await cursor.fetchone()
-
-    await c.message.edit_text(
-        "📊 СТАТИСТИКА\n\n"
-        f"🔄 Закрытых сделок: {count}\n"
-        f"💰 PNL: ${pnl:+.4f}\n"
-        f"⏰ Последний цикл: "
-        f"{await get('last_cycle')}",
-        reply_markup=back()
-    )
-
-    await c.answer()
-
-
-# ==========================================
-# AGENTS
-# ==========================================
-
-@dp.callback_query(F.data == "agents")
-async def agents_handler(c: CallbackQuery):
-
-    last = await get(
-        "last_ai"
-    )
-
-    calls = await ai_budget()
-
-    text = (
-        "🧠 ИИ-АГЕНТЫ\n\n"
-        f"🤖 Модель: {AI_MODEL}\n"
-        f"📊 Запросов сегодня: "
-        f"{calls}/{MAX_DAILY_AI_CALLS}\n\n"
-        "📜 Последнее решение:\n\n"
-        f"{last}"
-    )
-
-    if last_ai_error:
-
-        text += (
-            "\n\n⚠️ Последняя ошибка:\n"
-            + last_ai_error
-        )
-
-    await c.message.edit_text(
-        text[:4000],
-        reply_markup=back()
-    )
-
-    await c.answer()
-
-
-# ==========================================
-# ANALYZE
-# ==========================================
-
-@dp.callback_query(F.data == "analyze")
-async def analyze_handler(c: CallbackQuery):
-
-    await c.answer(
-        "Анализирую рынок..."
-    )
-
-    result = await trading_cycle()
-
-    await c.message.answer(
-        result[:4000],
-        reply_markup=back()
-    )
-
-
-# ==========================================
-# SETTINGS
-# ==========================================
-
-@dp.callback_query(F.data == "settings")
-async def settings_handler(c: CallbackQuery):
-
-    await c.message.edit_text(
-        "⚙️ НАСТРОЙКИ\n\n"
-        f"Стратегия: {await get('strategy')}\n"
-        f"Интервал: {await get('interval')} мин\n"
-        f"Дневной лимит: {await get('daily_limit')}%\n"
-        f"Макс. сделка: {await get('max_trade')}%\n\n"
-        "Выбери параметр:",
-        reply_markup=kb([
-            [
-                ("🟢 SAFE", "strategy_SAFE")
-            ],
-            [
-                ("🤖 AUTO", "strategy_AUTO")
-            ],
-            [
-                ("🔴 AGGRESSIVE", "strategy_AGGRESSIVE")
-            ],
-            [
-                ("⏰ 5 минут", "interval_5")
-            ],
-            [
-                ("⏰ 10 минут", "interval_10")
-            ],
-            [
-                ("⏰ 15 минут", "interval_15")
-            ],
-            [
-                ("📉 Лимит 5%", "loss_5")
-            ],
-            [
-                ("📉 Лимит 10%", "loss_10")
-            ],
-            [
-                ("📉 Лимит 20%", "loss_20")
-            ],
-            [
-                ("💵 Сделка 25%", "trade_25")
-            ],
-            [
-                ("💵 Сделка 50%", "trade_50")
-            ],
-            [
-                ("💵 Сделка 75%", "trade_75")
-            ],
-            [
-                ("🔙 Меню", "menu")
-            ]
-        ])
-    )
-
-    await c.answer()
-
-
-@dp.callback_query(
-    F.data.startswith("strategy_")
-)
-async def set_strategy(c: CallbackQuery):
-
-    value = c.data.split("_", 1)[1]
-
-    if value not in (
-        "SAFE",
-        "AUTO",
-        "AGGRESSIVE"
-    ):
-        await c.answer("Ошибка")
-        return
-
-    await put(
-        "strategy",
-        value
-    )
-
-    await c.message.edit_text(
-        f"✅ Стратегия: {value}",
-        reply_markup=back()
-    )
-
-    await c.answer()
-
-
-@dp.callback_query(
-    F.data.startswith("interval_")
-)
-async def set_interval(c: CallbackQuery):
-
-    value = c.data.split("_", 1)[1]
-
-    if value not in ("5", "10", "15"):
-        await c.answer("Ошибка")
-        return
-
-    await put(
-        "interval",
-        value
-    )
-
-    await c.message.edit_text(
-        f"✅ Интервал: {value} минут",
-        reply_markup=back()
-    )
-
-    await c.answer()
-
-
-@dp.callback_query(
-    F.data.startswith("loss_")
-)
-async def set_loss(c: CallbackQuery):
-
-    value = c.data.split("_", 1)[1]
-
-    if value not in ("5", "10", "20"):
-        await c.answer("Ошибка")
-        return
-
-    await put(
-        "daily_limit",
-        value
-    )
-
-    await c.message.edit_text(
-        f"✅ Дневной лимит: {value}%",
-        reply_markup=back()
-    )
-
-    await c.answer()
-
-
-@dp.callback_query(
-    F.data.startswith("trade_")
-)
-async def set_trade(c: CallbackQuery):
-
-    value = c.data.split("_", 1)[1]
-
-    if value not in ("25", "50", "75"):
-        await c.answer("Ошибка")
-        return
-
-    await put(
-        "max_trade",
-        value
-    )
-
-    await c.message.edit_text(
-        f"✅ Максимальная сделка: {value}%",
-        reply_markup=back()
-    )
-
-    await c.answer()
-
-
-# ==========================================
-# BACKGROUND
-# ==========================================
+# =========================================
+# BACKGROUND LOOP
+# =========================================
 
 async def trading_loop():
 
@@ -2001,29 +1873,27 @@ async def trading_loop():
 
                 logger.info(
                     "Trading cycle: %s",
-                    result[:200]
+                    result[:150]
                 )
 
         except Exception:
 
             logger.exception(
-                "Background trading error"
+                "Background error"
             )
 
-        # Проверяем интервал каждую минуту,
-        # чтобы изменения применялись быстрее.
         interval = int(
             await get("interval")
         )
 
-        for _ in range(interval):
+        await asyncio.sleep(
+            interval * 60
+        )
 
-            await asyncio.sleep(60)
 
-
-# ==========================================
-# MAIN
-# ==========================================
+# =========================================
+# START
+# =========================================
 
 async def main():
 
@@ -2032,8 +1902,8 @@ async def main():
 
     await init_db()
 
-    # После перезапуска требуется
-    # ручное включение автопилота.
+    # После перезапуска автопилот
+    # необходимо включить вручную.
     await put(
         "autopilot",
         "OFF"
@@ -2050,12 +1920,20 @@ async def main():
         )
     )
 
+    chain = await web3.eth.chain_id
+
+    if chain != CHAIN_ID:
+
+        raise RuntimeError(
+            "Подключена не Base Mainnet"
+        )
+
     await bot.delete_webhook(
         drop_pending_updates=True
     )
 
     logger.info(
-        "AI CRYPTO TRADER v1.3 STARTED"
+        "AI CRYPTO TRADER v2.0 STARTED"
     )
 
     task = asyncio.create_task(
@@ -2071,6 +1949,7 @@ async def main():
         task.cancel()
 
         try:
+
             await task
 
         except asyncio.CancelledError:
