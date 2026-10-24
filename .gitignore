@@ -1,6 +1,5 @@
 .env
 *.db
-*.db-journal
 *.db-shm
 *.db-wal
 *.sqlite
@@ -9,5 +8,3 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-.idea/
-.vscode/
